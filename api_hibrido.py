@@ -49,6 +49,8 @@ async def lifespan(app: FastAPI):
     try:
         path_fol_k = os.path.join(MODELS_DIR, 'kick_modelo_followers.pkl')
         path_fol_k_scaler = os.path.join(MODELS_DIR, 'kick_scaler_followers.pkl')
+        path_view_k = os.path.join(MODELS_DIR, 'kick_modelo_viewers.pkl')
+        path_view_k_scaler = os.path.join(MODELS_DIR, 'kick_scaler_viewers.pkl')
         
         if os.path.exists(path_fol_k) and os.path.exists(path_fol_k_scaler):
             cerebros['k_fol_model'] = joblib.load(path_fol_k)
@@ -56,6 +58,14 @@ async def lifespan(app: FastAPI):
             print("✅ Kick Followers: Modelo y escalador cargados.")
         else:
             print(f"⚠️ Kick Followers: Archivos no encontrados")
+            
+        if os.path.exists(path_view_k) and os.path.exists(path_view_k_scaler):
+            cerebros['k_view_model'] = joblib.load(path_view_k)
+            cerebros['k_view_scaler'] = joblib.load(path_view_k_scaler)
+            print("✅ Kick Viewers: Modelo y escalador cargados.")
+        else:
+            print(f"⚠️ Kick Viewers: Archivos no encontrados")
+            
     except Exception as e:
         print(f"❌ Kick: Error al cargar modelos: {e}")
 
@@ -243,9 +253,17 @@ def predict_twitch(data: TwitchInput):
 @app.post("/predecir/kick")
 def predict_kick(data: KickInput):
     """
-    Predicción para Kick - SOLO FOLLOWERS:
+    Predicción HÍBRIDA para Kick:
+    
+    FOLLOWERS: 
     - Usa LOGARITMO (lógica api_ia_twitch_v2.py)
     - followers_d28 = followers_d14 + crecimiento_log
+    
+    VIEWERS:
+    - Usa ESCALADORES directos (lógica api_ia_twitch.py)
+    - avg_viewers_d30 predicción directa escalada
+    
+    Input: 6 features (sin comentarios)
     """
     
     if 'k_fol_model' not in cerebros:
@@ -258,60 +276,87 @@ def predict_kick(data: KickInput):
         input_dict = data.dict()
         df = pd.DataFrame([input_dict])
         
-        # Aplicar LOG a todas las columnas
-        df_log = df.copy()
-        for col in df_log.columns:
-            df_log[f'{col}_log'] = np.log1p(df_log[col].astype(float))
+        # =====================================================================
+        # PARTE 1: PREDICCIÓN DE VIEWERS (lógica api_ia_twitch.py)
+        # =====================================================================
+        if 'k_view_model' in cerebros and 'k_view_scaler' in cerebros:
+            X_scaled_view = cerebros['k_view_scaler'].transform(df)
+            pred_viewers = cerebros['k_view_model'].predict(X_scaled_view)[0]
+            
+            # Validar finitud
+            if not np.isfinite(pred_viewers):
+                pred_viewers = 0
+        else:
+            pred_viewers = 0
+            print("⚠️ Modelo Viewers de Kick no disponible")
         
-        # Seleccionar columnas logarítmicas
-        cols_log = [
-            'FOLLOWERS_D14_log', 'FOLLOWERS_D21_log',
-            'AVG_VIEWERS_D14_log', 'HOURS_STREAMED_D14_log',
-            'AVG_VIEWERS_D1_log', 'HOURS_STREAMED_D1_log'
-        ]
-        cols_disponibles = [c for c in cols_log if c in df_log.columns]
-        X_input = df_log[cols_disponibles]
-        
-        # Predicción
-        pred_crecimiento_log = cerebros['k_fol_model'].predict(X_input)[0]
-        
-        # Limitar logaritmo
-        pred_crecimiento_log = np.clip(pred_crecimiento_log, None, 20)
-        
-        # Convertir de LOG a Real
-        crecimiento_real = np.expm1(pred_crecimiento_log)
-        if not np.isfinite(crecimiento_real):
+        # =====================================================================
+        # PARTE 2: PREDICCIÓN DE FOLLOWERS (lógica api_ia_twitch_v2.py con LOG)
+        # =====================================================================
+        if 'k_fol_model' in cerebros:
+            # Aplicar LOG a todas las columnas
+            df_log = df.copy()
+            for col in df_log.columns:
+                df_log[f'{col}_log'] = np.log1p(df_log[col].astype(float))
+            
+            # Seleccionar SOLO las 6 columnas de Kick (sin comments)
+            cols_log = [
+                'AVG_VIEWERS_D1_log',
+                'AVG_VIEWERS_D14_log',
+                'HOURS_STREAMED_D1_log',
+                'HOURS_STREAMED_D14_log',
+                'FOLLOWERS_D14_log',
+                'FOLLOWERS_D21_log'
+            ]
+            cols_disponibles = [c for c in cols_log if c in df_log.columns]
+            X_input = df_log[cols_disponibles]
+            
+            # Predicción
+            pred_crecimiento_log = cerebros['k_fol_model'].predict(X_input)[0]
+            
+            # Limitar logaritmo
+            pred_crecimiento_log = np.clip(pred_crecimiento_log, None, 20)
+            
+            # Convertir de LOG a Real
+            crecimiento_real = np.expm1(pred_crecimiento_log)
+            if not np.isfinite(crecimiento_real):
+                crecimiento_real = 0
+            
+            followers_d28 = data.FOLLOWERS_D14 + crecimiento_real
+            
+            # =====================================================================
+            # SANITY CHECK INTELIGENTE: Validar crecimiento razonable
+            # =====================================================================
+            if data.FOLLOWERS_D14 > 0:
+                pct_crecimiento = (crecimiento_real / data.FOLLOWERS_D14) * 100
+                
+                # Limites según tamaño del canal (IGUAL A TWITCH)
+                if data.FOLLOWERS_D14 >= 1_000_000:
+                    max_pct = 1.0
+                elif data.FOLLOWERS_D14 >= 500_000:
+                    max_pct = 2.0
+                elif data.FOLLOWERS_D14 >= 100_000:
+                    max_pct = 5.0
+                else:
+                    max_pct = 10.0
+                
+                # Si excede el límite, ajustar
+                if pct_crecimiento > max_pct:
+                    print(f"⚠️ Crecimiento anómalo detectado: {pct_crecimiento:.2f}%. Limitando a {max_pct}%")
+                    crecimiento_real = (data.FOLLOWERS_D14 * max_pct) / 100
+                    followers_d28 = data.FOLLOWERS_D14 + crecimiento_real
+                    
+        else:
+            followers_d28 = data.FOLLOWERS_D14
             crecimiento_real = 0
-        
-        followers_d28 = data.FOLLOWERS_D14 + crecimiento_real
-        
-        # =====================================================================
-        # SANITY CHECK INTELIGENTE: Validar crecimiento razonable
-        # =====================================================================
-        if data.FOLLOWERS_D14 > 0:
-            pct_crecimiento = (crecimiento_real / data.FOLLOWERS_D14) * 100
-            
-            # Limites según tamaño del canal
-            if data.FOLLOWERS_D14 >= 1_000_000:
-                max_pct = 1.0
-            elif data.FOLLOWERS_D14 >= 500_000:
-                max_pct = 2.0
-            elif data.FOLLOWERS_D14 >= 100_000:
-                max_pct = 5.0
-            else:
-                max_pct = 10.0
-            
-            # Si excede el límite, ajustar
-            if pct_crecimiento > max_pct:
-                print(f"⚠️ Crecimiento anómalo detectado: {pct_crecimiento:.2f}%. Limitando a {max_pct}%")
-                crecimiento_real = (data.FOLLOWERS_D14 * max_pct) / 100
-                followers_d28 = data.FOLLOWERS_D14 + crecimiento_real
+            print("⚠️ Modelo Followers de Kick no disponible")
         
         return {
             "status": "success",
             "plataforma": "Kick",
             "prediccion": {
                 "followers_d28": int(followers_d28),
+                "avg_viewers_d30": int(pred_viewers),
                 "debug": {
                     "followers_d14": int(data.FOLLOWERS_D14),
                     "crecimiento_neto": int(crecimiento_real),
@@ -340,7 +385,8 @@ def health_check():
         "modelos_cargados": list(cerebros.keys()),
         "twitch_followers_ok": 't_fol_model' in cerebros,
         "twitch_viewers_ok": 't_view_model' in cerebros,
-        "kick_followers_ok": 'k_fol_model' in cerebros
+        "kick_followers_ok": 'k_fol_model' in cerebros,
+        "kick_viewers_ok": 'k_view_model' in cerebros
     }
 
 # =============================================================================
