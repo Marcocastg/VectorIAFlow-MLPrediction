@@ -12,14 +12,19 @@ import uvicorn
 # =============================================================================
 MODELS_DIR = "models/"
 cerebros = {}
+    
+# =============================================================================
+# FUNCIÓN DE CARGA "JUSTO A TIEMPO" (LAZY LOADING)
+# =============================================================================
+def cargar_modelos_si_es_necesario():
+    """
+    Verifica si los modelos están en memoria. Si no, los carga.
+    Esto evita que el servidor tarde en arrancar y falle el CronJob.
+    """
+    if cerebros: 
+        return # Si ya hay algo en el diccionario, asumimos que ya cargó.
 
-# =============================================================================
-# GESTOR DE CICLO DE VIDA (Lifespan)
-# =============================================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("\n🧠 INICIANDO MOTOR DE IA - HÍBRIDO (FOLLOWERS + VIEWERS)...")
-    print(f"📂 Buscando modelos en: {MODELS_DIR}")
+    print("⏳ Primera petición detectada. Cargando modelos en memoria...")
     
     # --- CARGAR TWITCH ---
     try:
@@ -49,7 +54,8 @@ async def lifespan(app: FastAPI):
     try:
         path_fol_k = os.path.join(MODELS_DIR, 'kick_modelo_followers.pkl')
         path_fol_k_scaler = os.path.join(MODELS_DIR, 'kick_scaler_followers.pkl')
-        path_view_k = os.path.join(MODELS_DIR, 'kick_modelo_viewers.pkl')
+        # Asumiendo que también tienes viewers para kick o siguiendo la lógica separada
+        path_view_k = os.path.join(MODELS_DIR, 'kick_modelo_viewers.pkl') 
         path_view_k_scaler = os.path.join(MODELS_DIR, 'kick_scaler_viewers.pkl')
         
         if os.path.exists(path_fol_k) and os.path.exists(path_fol_k_scaler):
@@ -64,21 +70,24 @@ async def lifespan(app: FastAPI):
             cerebros['k_view_scaler'] = joblib.load(path_view_k_scaler)
             print("✅ Kick Viewers: Modelo y escalador cargados.")
         else:
-            print(f"⚠️ Kick Viewers: Archivos no encontrados")
+            # No bloqueante si no existe viewers de kick
+            pass 
             
     except Exception as e:
         print(f"❌ Kick: Error al cargar modelos: {e}")
 
+# =============================================================================
+# GESTOR DE CICLO DE VIDA (ARRANQUE RÁPIDO)
+# =============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 API iniciada. Esperando peticiones para cargar modelos...")
     yield
     cerebros.clear()
     print("🛑 Motor de IA apagado.")
 
-app = FastAPI(
-    title="API Híbrida de Predicción (Followers + Viewers)",
-    description="Combina lógica de viewers (api_ia_twitch.py) con followers (api_ia_twitch_v2.py)",
-    version="1.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="API de Predicción Twitch/Kick", version="2.0", lifespan=lifespan)
+
 
 # =============================================================================
 # DTOs
@@ -114,36 +123,15 @@ class KickInput(BaseModel):
 # =============================================================================
 @app.get("/")
 def home():
-    return {
-        "mensaje": "Motor de IA Híbrido activo",
-        "endpoints": {
-            "/predecir/twitch": "POST - Followers (LOG) + Viewers (Escalador)",
-            "/predecir/kick": "POST - Followers (LOG)",
-            "/health": "GET - Estado de modelos",
-            "/docs": "Documentación interactiva"
-        }
-    }
+    return {"status": "online", "mensaje": "Motor IA listo (Lazy Loading activo)"}
 
 @app.post("/predecir/twitch")
 def predict_twitch(data: TwitchInput):
-    """
-    Predicción HÍBRIDA para Twitch:
     
-    FOLLOWERS: 
-    - Usa LOGARITMO (lógica api_ia_twitch_v2.py)
-    - followers_d30 = followers_d1 + crecimiento_log
+    cargar_modelos_si_es_necesario()
     
-    VIEWERS:
-    - Usa ESCALADORES directos (lógica api_ia_twitch.py)
-    - avg_viewers_d30 predicción directa escalada
-    """
-    
-    # Validar que al menos Viewers esté cargado
-    if 't_view_model' not in cerebros or 't_view_scaler' not in cerebros:
-        raise HTTPException(
-            status_code=503,
-            detail="Modelo Viewers de Twitch no cargado"
-        )
+    if 't_fol_model' not in cerebros or 't_fol_scaler' not in cerebros:
+        raise HTTPException(status_code=503, detail="Modelos de Twitch no pudieron cargarse (faltan archivos .pkl).")
 
     try:
         input_dict = data.dict()
@@ -252,25 +240,11 @@ def predict_twitch(data: TwitchInput):
 
 @app.post("/predecir/kick")
 def predict_kick(data: KickInput):
-    """
-    Predicción HÍBRIDA para Kick:
     
-    FOLLOWERS: 
-    - Usa LOGARITMO (lógica api_ia_twitch_v2.py)
-    - followers_d28 = followers_d14 + crecimiento_log
-    
-    VIEWERS:
-    - Usa ESCALADORES directos (lógica api_ia_twitch.py)
-    - avg_viewers_d30 predicción directa escalada
-    
-    Input: 6 features (sin comentarios)
-    """
-    
-    if 'k_fol_model' not in cerebros:
-        raise HTTPException(
-            status_code=503,
-            detail="Modelo Followers de Kick no cargado"
-        )
+    cargar_modelos_si_es_necesario()
+
+    if 'k_fol_model' not in cerebros or 'k_fol_scaler' not in cerebros:
+        raise HTTPException(status_code=503, detail="Modelos de Kick no pudieron cargarse.")
 
     try:
         input_dict = data.dict()
